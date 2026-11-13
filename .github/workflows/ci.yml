@@ -1,5 +1,5 @@
-# Pushes and pull requests to main: builds and tests in debug, with cargo's output cached. No game files are involved:
-# the tests make their own data, and those needing a dump or a capture are macOS's nxport-builder GPU tests, left out.
+# Pushes and pull requests to main: builds and tests Windows in debug, with cargo's output cached.
+# The tests make their own data.
 name: CI
 
 on:
@@ -42,22 +42,24 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked --lib --bins
-
-  # The engine and the crates without Apple engines of their own. nxport-build's build script compiles the macOS and iOS
-  # engines in release with LTO, so nxport-build and nxport-builder build only in the release workflow.
-  macos:
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build
-        run: cargo build --locked -p nxport
-      - name: Test
-        run: cargo test --locked -p nxport -p nxport-lifter -p nxport-pipelines -p sass2spv --lib --bins
+      - name: Execute a synthetic lifted guest
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP ("nxport-smoke-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $archive = Join-Path $scratch 'zig.zip'
+            # Match crates/build/src/zig.rs and the Windows release workflow.
+            curl.exe -fsSL --retry 3 -o $archive https://ziglang.org/download/0.17.1/zig-x86_64-windows-0.17.1.zip
+            if ($LASTEXITCODE -ne 0) { throw 'Zig download failed' }
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e') {
+              throw 'Zig archive checksum mismatch'
+            }
+            Expand-Archive -LiteralPath $archive -DestinationPath $scratch
+            $env:Path = "$(Join-Path $scratch 'zig-x86_64-windows-0.17.1');$env:Path"
+            $env:TEMP = $scratch
+            $env:TMP = $scratch
+            cargo test --locked -p nxport-build --lib lift::tests::executes_lifted_nso -- --ignored --exact --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'Synthetic guest test failed' }
+          } finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force
+          }

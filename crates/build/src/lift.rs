@@ -579,11 +579,8 @@ fn lift_image(
 mod tests {
     use super::*;
 
-    /// An uncompressed NSO holding the lifter's sample module (no MOD0: no dynamic tables or .eh_frame_hdr).
-    #[test]
-    fn lifts_an_nso() {
-        let (base, img, text) = nxport_lifter::module::sample_image();
-        let text_len = (text.end - text.start) as usize;
+    /// An uncompressed NSO with no MOD0, dynamic tables or .eh_frame_hdr.
+    fn write_test_nso(path: &Path, img: &[u8], text_len: usize) {
         let mut f = vec![0u8; 0x100];
         f[0..4].copy_from_slice(b"NSO0");
         let seg = |f: &mut Vec<u8>, hdr: usize, file_off: usize, mem_off: usize, size: usize| {
@@ -594,15 +591,82 @@ mod tests {
         seg(&mut f, 0x10, 0x100, 0, text_len);
         seg(&mut f, 0x20, 0x100 + text_len, text_len, img.len() - text_len);
         seg(&mut f, 0x30, 0x100 + img.len(), img.len(), 0);
-        f.extend_from_slice(&img);
+        f.extend_from_slice(img);
+        std::fs::write(path, f).unwrap();
+    }
+
+    #[test]
+    fn lifts_an_nso() {
+        let (base, img, text) = nxport_lifter::module::sample_image();
         let dir = std::env::temp_dir().join(format!("nxport-lift-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let nso = dir.join("main");
-        std::fs::write(&nso, &f).unwrap();
+        write_test_nso(&nso, &img, (text.end - text.start) as usize);
         let out = lift_nso(&nso, "main", base, &dir.join("c")).unwrap();
         assert_eq!((out.functions, out.jump_tables), (3, 1));
         assert!(dir.join("c/cpu.h").is_file() && dir.join("c/main_table.c").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires Zig 0.17.1 on PATH; run in a separate test process"]
+    fn executes_lifted_nso() {
+        use nxport::lifted::{GuestLibrary, Handlers};
+        use nxport_lifter::abi::Cpu;
+
+        // The sample uses ADRP to read its jump table, so its relocated base must be page-aligned.
+        #[repr(align(4096))]
+        struct GuestImage([u8; 4096]);
+        #[repr(align(16))]
+        struct GuestStack([u8; 4096]);
+
+        let (_, img, text) = nxport_lifter::module::sample_image();
+        let mut image = GuestImage([0; 4096]);
+        image.0[..img.len()].copy_from_slice(&img);
+        let base = image.0.as_mut_ptr() as u64;
+        let mut stack = GuestStack([0; 4096]);
+
+        // GuestLibrary keeps the DLL loaded until the test process exits. The runner cleans its temp directory.
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nxport guest smoke {}-{timestamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let dump = dir.join("dump");
+        let exefs = dump.join("ExeFS");
+        std::fs::create_dir_all(&exefs).unwrap();
+        std::fs::create_dir(dump.join("RomFS")).unwrap();
+        let nso = exefs.join("main");
+        let c_dir = dir.join("c");
+        let dll = dir.join("guest.dll");
+        write_test_nso(&nso, &img, (text.end - text.start) as usize);
+        eprintln!("Lifting the synthetic NSO at guest address {base:#x}");
+        let lifted = lift_nso(&nso, "main", base, &c_dir).expect("lift synthetic NSO");
+        assert_eq!((lifted.functions, lifted.jump_tables), (3, 1));
+        let cc = ["zig".into(), "cc".into()];
+        eprintln!("Compiling the lifted C with Zig");
+        compile(&c_dir, &dll, &cc, 1, None, Some(&dir.join("zig-cache")), &|_, _| {}).expect("compile synthetic guest DLL");
+
+        let mut settings = nxport::settings::Settings::default();
+        settings.files.game_dir = Some(dump);
+        settings.guest.live_patches = false;
+        nxport::settings::install(settings);
+        let handlers = Handlers {
+            svc: |_, imm, pc| panic!("unexpected SVC {imm:#x} at {pc:#x}"),
+            trap: |_, kind, imm, pc| panic!("unexpected trap {kind} ({imm:#x}) at {pc:#x}"),
+            unknown: |cpu| panic!("unresolved guest address {:#x}", cpu.pc),
+            ticks: || 0,
+        };
+        eprintln!("Loading the synthetic guest DLL");
+        let guest = GuestLibrary::load(&dll, &["main"], None, handlers).expect("load synthetic guest DLL");
+        // Cpu contains only integers and a nullable raw pointer. Start with all registers cleared.
+        let mut cpu: Cpu = unsafe { std::mem::zeroed() };
+        let stack_top = stack.0.as_mut_ptr().wrapping_add(stack.0.len()) as u64;
+        cpu.sp = stack_top;
+        eprintln!("Executing the synthetic guest");
+        let result = unsafe { guest.call(&mut cpu, base, &[]) };
+        eprintln!("Synthetic guest returned {result}");
+        assert_eq!(result, 150);
+        assert_eq!(cpu.sp, stack_top);
     }
 }
 
@@ -621,7 +685,19 @@ mod fetch_tests {
         e.write_all(b"profile").unwrap();
         e.finish().unwrap();
         // file:///C:/... on Windows, file:///tmp/... elsewhere.
-        let url = |p: &std::path::Path| format!("file:///{}", p.display().to_string().replace('\\', "/").trim_start_matches('/'));
+        let url = |p: &std::path::Path| {
+            use std::fmt::Write as _;
+            let path = p.to_str().unwrap().replace('\\', "/");
+            let mut url = String::from("file:///");
+            for b in path.trim_start_matches('/').bytes() {
+                if b.is_ascii_alphanumeric() || b"-._~/:".contains(&b) {
+                    url.push(char::from(b));
+                } else {
+                    write!(url, "%{b:02X}").unwrap();
+                }
+            }
+            url
+        };
 
         let dest = dir.join("sub").join("p.profdata");
         fetch_gzipped(&url(&gz), &dest).unwrap();
