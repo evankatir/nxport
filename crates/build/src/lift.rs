@@ -635,9 +635,11 @@ mod tests {
         let c_dir = dir.join("c");
         let dll = dir.join("guest.dll");
         write_test_nso(&nso, &img, (text.end - text.start) as usize);
+        eprintln!("Lifting the synthetic NSO at guest address {base:#x}");
         let lifted = lift_nso(&nso, "main", base, &c_dir).expect("lift synthetic NSO");
         assert_eq!((lifted.functions, lifted.jump_tables), (3, 1));
         let cc = ["zig".into(), "cc".into()];
+        eprintln!("Compiling the lifted C with Zig");
         compile(&c_dir, &dll, &cc, 1, None, Some(&dir.join("zig-cache")), &|_, _| {}).expect("compile synthetic guest DLL");
 
         nxport::settings::install(nxport::settings::Settings::default());
@@ -647,12 +649,16 @@ mod tests {
             unknown: |cpu| panic!("unresolved guest address {:#x}", cpu.pc),
             ticks: || 0,
         };
+        eprintln!("Loading the synthetic guest DLL");
         let guest = GuestLibrary::load(&dll, &["main"], None, handlers).expect("load synthetic guest DLL");
         // Cpu contains only integers and a nullable raw pointer. Start with all registers cleared.
         let mut cpu: Cpu = unsafe { std::mem::zeroed() };
         let stack_top = stack.0.as_mut_ptr().wrapping_add(stack.0.len()) as u64;
         cpu.sp = stack_top;
-        assert_eq!(unsafe { guest.call(&mut cpu, base, &[]) }, 150);
+        eprintln!("Executing the synthetic guest");
+        let result = unsafe { guest.call(&mut cpu, base, &[]) };
+        eprintln!("Synthetic guest returned {result}");
+        assert_eq!(result, 150);
         assert_eq!(cpu.sp, stack_top);
     }
 }

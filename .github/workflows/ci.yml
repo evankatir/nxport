@@ -58,7 +58,7 @@ jobs:
             $env:Path = "$(Join-Path $scratch 'zig-x86_64-windows-0.17.1');$env:Path"
             $env:TEMP = $scratch
             $env:TMP = $scratch
-            cargo test --locked -p nxport-build --lib lift::tests::executes_lifted_nso -- --ignored --exact
+            cargo test --locked -p nxport-build --lib lift::tests::executes_lifted_nso -- --ignored --exact --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'Synthetic guest test failed' }
           } finally {
             Remove-Item -LiteralPath $scratch -Recurse -Force
