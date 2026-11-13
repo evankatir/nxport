@@ -631,7 +631,11 @@ mod tests {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("nxport guest smoke {}-{timestamp}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let nso = dir.join("main");
+        let dump = dir.join("dump");
+        let exefs = dump.join("ExeFS");
+        std::fs::create_dir_all(&exefs).unwrap();
+        std::fs::create_dir(dump.join("RomFS")).unwrap();
+        let nso = exefs.join("main");
         let c_dir = dir.join("c");
         let dll = dir.join("guest.dll");
         write_test_nso(&nso, &img, (text.end - text.start) as usize);
@@ -642,7 +646,10 @@ mod tests {
         eprintln!("Compiling the lifted C with Zig");
         compile(&c_dir, &dll, &cc, 1, None, Some(&dir.join("zig-cache")), &|_, _| {}).expect("compile synthetic guest DLL");
 
-        nxport::settings::install(nxport::settings::Settings::default());
+        let mut settings = nxport::settings::Settings::default();
+        settings.files.game_dir = Some(dump);
+        settings.guest.live_patches = false;
+        nxport::settings::install(settings);
         let handlers = Handlers {
             svc: |_, imm, pc| panic!("unexpected SVC {imm:#x} at {pc:#x}"),
             trap: |_, kind, imm, pc| panic!("unexpected trap {kind} ({imm:#x}) at {pc:#x}"),
